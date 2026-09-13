@@ -1,0 +1,6 @@
+{
+  "name": "Pink & JARVIS AI Studio",
+  "description": "Interface imersiva e minimalista da IA PINK com presença holográfica viva, comandos de voz, visão computacional e caixa de envio de mensagens e arquivos.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
