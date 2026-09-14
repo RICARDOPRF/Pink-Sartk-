@@ -11,7 +11,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  group: pink-sartk-pages
   cancel-in-progress: true
 
 jobs:
@@ -20,22 +20,34 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+
       - name: Install dependencies
-        run: npm install
-      - name: Build frontend
+        run: npm install --no-audit --no-fund
+
+      - name: Build static frontend
         run: npm run build
         env:
           NODE_ENV: production
-      - name: Prepare static Pages artifact
+          VITE_PINK_SUPABASE_URL: ${{ vars.VITE_PINK_SUPABASE_URL }}
+          VITE_PINK_SUPABASE_ANON_KEY: ${{ vars.VITE_PINK_SUPABASE_ANON_KEY }}
+
+      - name: Validate Pages artifact
+        shell: bash
         run: |
-          rm -f dist/server.cjs dist/server.cjs.map
+          test -f dist/index.html
+          test -d dist/assets
           cp dist/index.html dist/404.html
+          touch dist/.nojekyll
+          echo "Pages artifact ready: $(du -sh dist | cut -f1)"
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
