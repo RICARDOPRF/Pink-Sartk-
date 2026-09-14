@@ -59,19 +59,30 @@ jobs:
           set -euo pipefail
           JS_FILE="$(find dist/assets -maxdepth 1 -type f -name 'index-*.js' | head -n 1)"
           CSS_FILE="$(find dist/assets -maxdepth 1 -type f -name 'index-*.css' | head -n 1)"
+
           mkdir -p pages-runtime
           cp "$JS_FILE" pages-runtime/pink-stark.js
           cp "$CSS_FILE" pages-runtime/pink-stark.css
           printf '%s\n' "${GITHUB_SHA}" > pages-runtime/version.txt
 
-          if git diff --quiet -- pages-runtime && git diff --cached --quiet; then
+          RUNTIME_CHANGES="$(git status --porcelain --untracked-files=all -- pages-runtime)"
+          if [ -z "$RUNTIME_CHANGES" ]; then
             echo "Pages runtime already synchronized."
             exit 0
           fi
 
+          echo "Runtime changes detected:"
+          printf '%s\n' "$RUNTIME_CHANGES"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pages-runtime
+          git add --all pages-runtime
+
+          test -f pages-runtime/pink-stark.js
+          test -f pages-runtime/pink-stark.css
+          test -f pages-runtime/version.txt
+          git diff --cached --quiet && { echo "Runtime files were not staged."; exit 1; }
+
           git commit -m "chore(pages): sync compiled Pink Stark runtime [skip ci]"
           git push origin HEAD:main
 
