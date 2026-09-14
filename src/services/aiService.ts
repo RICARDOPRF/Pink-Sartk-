@@ -22,14 +22,18 @@ const STUDIO_SUPABASE_URL =
 // (OpenAI, Gemini, NVIDIA, etc.) remain protected inside the Pink Studio Edge Functions.
 const STUDIO_SUPABASE_ANON_KEY =
   ((import.meta as any).env?.VITE_PINK_SUPABASE_ANON_KEY as string | undefined) ||
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1lbWJ5cmJneW5pY2xsenJoanNsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIwNzE3MTAsImV4cCI6MjA5NzY0NzcxMH0.5_5fKYLYHlGCvggoF7t9QtwkvVaRX0LKkDtw--brJY0";
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJIUzI1NiIsInJlZiI6Im1lbWJ5cmJneW5pY2xsenJoanNsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIwNzE3MTAsImV4cCI6MjA5NzY0NzcxMH0.5_5fKYLYHlGCvggoF7t9QtwkvVaRX0LKkDtw--brJY0";
 
 const FUNCTIONS = {
   openai: "pink-openai",
+  nvidia: "pink-nvidia",
   geminiReasoning: "pink-gemini-reasoning",
   vision: "pink-vision",
   health: "pink-health",
 } as const;
+
+const GEMINI_QUOTA_COOLDOWN_MS = 15 * 60 * 1000;
+let geminiBlockedUntil = 0;
 
 function edgeUrl(functionName: string): string {
   return `${STUDIO_SUPABASE_URL.replace(/\/$/, "")}/functions/v1/${functionName}`;
@@ -126,12 +130,31 @@ function extractReply(payload: JsonRecord): string {
 }
 
 function payloadError(payload: JsonRecord, status: number): string {
+  const nestedProviderMessage = payload?.details?.message || payload?.details?.error;
   return String(
     payload.providerMessage ||
+      nestedProviderMessage ||
       payload.detail ||
       payload.message ||
       payload.error ||
       `Erro HTTP ${status}`
+  );
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error || "Erro desconhecido");
+}
+
+function isQuotaOrRateLimitError(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase();
+  return (
+    message.includes("quota") ||
+    message.includes("rate limit") ||
+    message.includes("rate-limit") ||
+    message.includes("resource_exhausted") ||
+    message.includes("too many requests") ||
+    /(^|\D)429(\D|$)/.test(message)
   );
 }
 
@@ -154,23 +177,65 @@ async function askOpenAI(input: string): Promise<{ reply: string; model: string 
   return { reply, model: String(payload.model || "pink-openai") };
 }
 
-async function askGeminiFallback(input: string): Promise<{ reply: string; model: string }> {
-  const { response, payload } = await requestJson(edgeUrl(FUNCTIONS.geminiReasoning), {
+async function askNvidiaFallback(input: string): Promise<{ reply: string; model: string }> {
+  const { response, payload } = await requestJson(edgeUrl(FUNCTIONS.nvidia), {
     method: "POST",
     headers: edgeHeaders(),
     body: JSON.stringify({
-      input,
-      thinkingLevel: "high",
-      maxOutputTokens: 2200,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Você é o motor NVIDIA NIM auxiliar da PINK, assistente da Lean Performance Solutions. Responda em português do Brasil, preserve o contexto recebido, seja técnico e objetivo e não invente acesso a sistemas ou dados externos.",
+        },
+        { role: "user", content: input },
+      ],
+      temperature: 0.3,
+      top_p: 0.9,
+      max_tokens: 1600,
     }),
   });
 
   const reply = extractReply(payload);
-  if (!response.ok || payload?.ok === false || !reply) {
+  if (!response.ok || !reply) {
     throw new Error(payloadError(payload, response.status));
   }
 
-  return { reply, model: String(payload.model || "pink-gemini-reasoning") };
+  return { reply, model: String(payload.model || "pink-nvidia") };
+}
+
+async function askGeminiFallback(input: string): Promise<{ reply: string; model: string }> {
+  if (Date.now() < geminiBlockedUntil) {
+    throw new Error("Gemini temporariamente indisponível por limite de uso.");
+  }
+
+  try {
+    const { response, payload } = await requestJson(edgeUrl(FUNCTIONS.geminiReasoning), {
+      method: "POST",
+      headers: edgeHeaders(),
+      body: JSON.stringify({
+        input,
+        thinkingLevel: "high",
+        maxOutputTokens: 1800,
+      }),
+    });
+
+    const reply = extractReply(payload);
+    if (!response.ok || payload?.ok === false || !reply) {
+      const error = new Error(payloadError(payload, response.status));
+      if (response.status === 429 || isQuotaOrRateLimitError(error)) {
+        geminiBlockedUntil = Date.now() + GEMINI_QUOTA_COOLDOWN_MS;
+      }
+      throw error;
+    }
+
+    return { reply, model: String(payload.model || "pink-gemini-reasoning") };
+  } catch (error) {
+    if (isQuotaOrRateLimitError(error)) {
+      geminiBlockedUntil = Date.now() + GEMINI_QUOTA_COOLDOWN_MS;
+    }
+    throw error;
+  }
 }
 
 async function analyzeVision(image: string, prompt: string): Promise<string> {
@@ -227,24 +292,48 @@ export async function sendChatMessage(
     visionContext
   );
 
-  let result: { reply: string; model: string };
+  let result: { reply: string; model: string } | null = null;
   let keyStatus = "studio_edge_online";
+  const providerErrors: string[] = [];
 
   try {
     result = await askOpenAI(input);
+    keyStatus = "openai_primary";
   } catch (openAiError) {
-    console.warn("Supervisor OpenAI indisponível; ativando Gemini fallback.", openAiError);
-    keyStatus = "gemini_fallback";
+    providerErrors.push(`OpenAI: ${errorMessage(openAiError)}`);
+    console.warn("Supervisor OpenAI indisponível; ativando NVIDIA fallback.", openAiError);
+  }
+
+  if (!result) {
+    try {
+      result = await askNvidiaFallback(input);
+      keyStatus = "nvidia_fallback";
+    } catch (nvidiaError) {
+      providerErrors.push(`NVIDIA: ${errorMessage(nvidiaError)}`);
+      console.warn("NVIDIA NIM indisponível; avaliando Gemini fallback.", nvidiaError);
+    }
+  }
+
+  if (!result) {
     try {
       result = await askGeminiFallback(input);
+      keyStatus = "gemini_fallback";
     } catch (geminiError) {
-      if (visionContext) {
-        result = { reply: visionContext, model: "pink-vision" };
-        keyStatus = "vision_only";
-      } else {
-        throw geminiError;
-      }
+      providerErrors.push(`Gemini: ${errorMessage(geminiError)}`);
+      console.warn("Gemini indisponível; usando último fallback disponível.", geminiError);
     }
+  }
+
+  if (!result && visionContext) {
+    result = { reply: visionContext, model: "pink-vision" };
+    keyStatus = "vision_only";
+  }
+
+  if (!result) {
+    console.error("Todos os provedores da Pink falharam", providerErrors);
+    throw new Error(
+      "Os motores de IA da Pink estão temporariamente indisponíveis. A interface continua online; tente novamente em instantes enquanto o roteador alterna entre os provedores."
+    );
   }
 
   const latencyMs = Math.max(1, Math.round(performance.now() - startedAt));
@@ -272,13 +361,18 @@ export async function analyzeAiFile(
     return { summary: result.reply, charCount: content.length };
   } catch {
     try {
-      const result = await askGeminiFallback(prompt);
+      const result = await askNvidiaFallback(prompt);
       return { summary: result.reply, charCount: content.length };
     } catch {
-      return {
-        summary: `Arquivo ${fileName} carregado com sucesso. Contém ${content.length.toLocaleString("pt-BR")} caracteres e está pronto para ser usado como contexto pela Pink.`,
-        charCount: content.length,
-      };
+      try {
+        const result = await askGeminiFallback(prompt);
+        return { summary: result.reply, charCount: content.length };
+      } catch {
+        return {
+          summary: `Arquivo ${fileName} carregado com sucesso. Contém ${content.length.toLocaleString("pt-BR")} caracteres e está pronto para ser usado como contexto pela Pink.`,
+          charCount: content.length,
+        };
+      }
     }
   }
 }
@@ -307,7 +401,8 @@ export async function fetchSystemHealth(): Promise<SystemStatus> {
       activeRouters: [
         "Pink LPS Studio Cloud",
         "ChatGPT Supervisor",
-        "Gemini Reasoning Fallback",
+        "NVIDIA NIM Fallback",
+        Date.now() < geminiBlockedUntil ? "Gemini em cooldown" : "Gemini Reasoning Fallback",
         "Pink Vision",
       ],
     };
